@@ -326,6 +326,12 @@ func (tci *testCertIssuer) Pool() *x509.CertPool {
 var testCertRoot = newCertIssuer()
 
 func startServer(t *testing.T, ctx context.Context, controlURL, hostname string) (*Server, netip.Addr, key.NodePublic) {
+	return startServerWith(t, ctx, controlURL, hostname, nil)
+}
+
+// startServerWith is startServer with a hook to set Server fields before the
+// node starts (fields like ForwardUnhandledFlows must be set before Start).
+func startServerWith(t *testing.T, ctx context.Context, controlURL, hostname string, configure func(*Server)) (*Server, netip.Addr, key.NodePublic) {
 	t.Helper()
 
 	tmp := filepath.Join(t.TempDir(), hostname)
@@ -336,6 +342,9 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 		Hostname:   hostname,
 		Store:      new(mem.Store),
 		Ephemeral:  true,
+	}
+	if configure != nil {
+		configure(s)
 	}
 	if *verboseNodes {
 		s.Logf = t.Logf
@@ -665,6 +674,168 @@ func TestDialThroughExitNode(t *testing.T) {
 	if src.Addr() != s2ip {
 		t.Errorf("exit node saw connection from %v; want s2's tailnet IP %v", src, s2ip)
 	}
+}
+
+func TestForwardUnhandledGate(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		on   bool
+		dst  string
+		want bool
+	}{
+		{"disabled public", false, "203.0.113.42:443", false},
+		{"enabled public", true, "203.0.113.42:443", true},
+		{"enabled private", true, "192.168.1.10:53", true},
+		{"enabled tailnet v4", true, "100.64.0.7:443", false},
+		{"enabled tailnet v6", true, "[fd7a:115c:a1e0::7]:443", false},
+		{"enabled service IP", true, "100.100.100.100:53", false},
+		{"enabled loopback", true, "127.0.0.1:8080", false},
+		{"enabled link-local", true, "169.254.1.1:80", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{ForwardUnhandledFlows: tt.on}
+			if got := s.forwardUnhandled(netip.MustParseAddrPort(tt.dst)); got != tt.want {
+				t.Errorf("forwardUnhandled(%v) = %v; want %v", tt.dst, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestForwardUnhandledFlowsThroughExitNode proves the ForwardUnhandledFlows
+// path end to end: a member dials a public address, the exit node's netstack
+// forwards the flow to its host network, and TCP and UDP both reach the
+// destination. The destination has to be outside this host's local networks:
+// the packet filter deliberately refuses exit-node traffic to a node's own
+// LAN, so a loopback or LAN echo server would be testing the refusal.
+func TestForwardUnhandledFlowsThroughExitNode(t *testing.T) {
+	// No tstest.ResourceCheck here: netstack keeps a UDP flow's mapping (and
+	// its copy goroutine) for a 2-minute idle timeout after the flow is done,
+	// which outlives the test by design.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const (
+		tcpDest = "1.1.1.1:443"
+		udpDest = "1.1.1.1:53"
+	)
+	// Only run what this host can reach at all; an offline runner skips.
+	tcpOK := func() bool {
+		c, err := net.DialTimeout("tcp", tcpDest, 5*time.Second)
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	}()
+	udpOK := dnsProbe(udpDest) == nil
+	if !tcpOK && !udpOK {
+		t.Skipf("host cannot reach %s or %s", tcpDest, udpDest)
+	}
+
+	controlURL, c := startControl(t)
+	s1, s1ip, s1PubKey := startServerWith(t, ctx, controlURL, "s1", func(s *Server) {
+		s.ForwardUnhandledFlows = true
+	})
+	lc1 := must.Get(s1.LocalClient())
+	must.Get(lc1.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:              ipn.Prefs{AdvertiseRoutes: tsaddr.ExitRoutes()},
+		AdvertiseRoutesSet: true,
+	}))
+	c.SetSubnetRoutes(s1PubKey, tsaddr.ExitRoutes())
+
+	s2, _, _ := startServer(t, ctx, controlURL, "s2")
+	lc2 := must.Get(s2.LocalClient())
+	pingCtx, cancelPing := pingTimeout(ctx)
+	defer cancelPing()
+	must.Get(lc2.Ping(pingCtx, s1ip, tailcfg.PingTSMP))
+	must.Get(lc2.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:         ipn.Prefs{ExitNodeID: c.Node(s1PubKey).StableID},
+		ExitNodeIDSet: true,
+	}))
+
+	// Wait for the exit node's default route, then make a system dial a
+	// loud failure: every flow has to go through s1, not this host.
+	if err := tstest.WaitFor(30*time.Second, func() error {
+		p, ok := s2.lb.PeerForIP(netip.MustParseAddr("1.1.1.1"))
+		if !ok {
+			return fmt.Errorf("no peer for 1.1.1.1 yet")
+		}
+		if p.Node.Key() != s1PubKey {
+			return fmt.Errorf("peer for 1.1.1.1 is %v; want s1 %v", p.Node.Key(), s1PubKey)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s2.Sys().Dialer.Get().SetSystemDialerForTest(func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		return nil, fmt.Errorf("system dialer called unexpectedly for %s %s", netw, addr)
+	})
+
+	t.Run("tcp", func(t *testing.T) {
+		if !tcpOK {
+			t.Skipf("%s is not reachable from this host", tcpDest)
+		}
+		conn, err := s2.Dial(ctx, "tcp", tcpDest)
+		if err != nil {
+			t.Fatalf("tcp dial %s through the exit node: %v", tcpDest, err)
+		}
+		conn.Close()
+	})
+
+	t.Run("udp", func(t *testing.T) {
+		if !udpOK {
+			t.Skipf("%s is not reachable from this host", udpDest)
+		}
+		uconn, err := s2.Dial(ctx, "udp", udpDest)
+		if err != nil {
+			t.Fatalf("udp dial %s through the exit node: %v", udpDest, err)
+		}
+		defer uconn.Close()
+		uconn.SetDeadline(time.Now().Add(20 * time.Second))
+		if _, err := uconn.Write(dnsQuery); err != nil {
+			t.Fatalf("udp write: %v", err)
+		}
+		buf := make([]byte, 512)
+		n, err := uconn.Read(buf)
+		if err != nil {
+			t.Fatalf("udp read: %v", err)
+		}
+		if n < 12 || buf[0] != dnsQuery[0] || buf[1] != dnsQuery[1] {
+			t.Fatalf("udp reply is not the DNS answer to our query (%d bytes)", n)
+		}
+	})
+}
+
+// dnsQuery is a minimal recursive A query for example.com, used to prove a
+// UDP flow carries a reply through the exit node.
+var dnsQuery = []byte{
+	0xab, 0xcd, // ID
+	0x01, 0x00, // RD
+	0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // QDCOUNT=1
+	7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+	0x00, 0x01, // QTYPE A
+	0x00, 0x01, // QCLASS IN
+}
+
+func dnsProbe(addr string) error {
+	c, err := net.DialTimeout("udp", addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(dnsQuery); err != nil {
+		return err
+	}
+	buf := make([]byte, 512)
+	n, err := c.Read(buf)
+	if err != nil {
+		return err
+	}
+	if n < 12 || buf[0] != dnsQuery[0] || buf[1] != dnsQuery[1] {
+		return fmt.Errorf("not a DNS answer")
+	}
+	return nil
 }
 
 func TestLoopbackLocalAPI(t *testing.T) {

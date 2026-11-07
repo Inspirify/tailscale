@@ -200,6 +200,7 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
@@ -333,6 +334,23 @@ type Server struct {
 	//
 	// This field must be set before calling Start.
 	Tun tun.Device
+
+	// ForwardUnhandledFlows, if true, lets a flow to an address outside the
+	// tailnet that no listener handles be forwarded to the host network by
+	// the netstack forwarder, instead of being rejected. It is what a node
+	// acting as an exit node or subnet router needs: the forwarder dials the
+	// destination from this process's network and copies bytes back over the
+	// flow, for both TCP and UDP.
+	//
+	// Addresses inside the tailnet (including the Tailscale service IP) are
+	// never forwarded: a flow to one with no listener is still rejected, so
+	// enabling this does not expose the host's loopback to peers. The host's
+	// own loopback and link-local destinations are not forwarded either.
+	//
+	// Being able to forward is not by itself reachability: the control plane
+	// still has to grant this node the exit/subnet routes. This field only
+	// decides what happens to a flow that arrives.
+	ForwardUnhandledFlows bool
 
 	initOnce            sync.Once
 	initErr             error
@@ -1297,7 +1315,7 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 				return connHandler, intercept
 			}
 		}
-		return nil, true // don't handle, don't forward to localhost
+		return nil, !s.forwardUnhandled(dst)
 	}
 	return ln.handle, true
 }
@@ -1305,9 +1323,25 @@ func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
 	ln, ok := s.listenerForDstAddr("udp", dst, false)
 	if !ok {
-		return nil, true // don't handle, don't forward to localhost
+		return nil, !s.forwardUnhandled(dst)
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
+}
+
+// forwardUnhandled reports whether a flow to dst that no listener handles may
+// be handed to the netstack forwarder (a host-network dial and copy) instead
+// of being rejected. It is always false unless ForwardUnhandledFlows is set,
+// and never true for a tailnet or service address: those stay local, so this
+// cannot turn a peer's flow into a connection to this host's loopback.
+func (s *Server) forwardUnhandled(dst netip.AddrPort) bool {
+	if !s.ForwardUnhandledFlows {
+		return false
+	}
+	addr := dst.Addr().Unmap()
+	if tsaddr.IsTailscaleIP(addr) {
+		return false
+	}
+	return addr.IsGlobalUnicast()
 }
 
 // Listen announces only on the Tailscale network.
