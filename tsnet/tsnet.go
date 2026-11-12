@@ -1116,6 +1116,19 @@ func (s *Server) resolveAuthKey() (string, error) {
 }
 
 func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker, tsLogf logger.Logf) error {
+	// Oaken patch: disable logtail entirely — no logpolicy config file, no
+	// filch buffer, no logger uploading to log.tailscale.com. Oaken device
+	// logs go to the operator's own Loki via Alloy; the engine must not
+	// contact Tailscale's log endpoint. Returning before the config is read
+	// or created (rather than logtail.Disable()) matters: Disable only drops
+	// sends, while the logpolicy config below would still be written to
+	// <state>/tailscaled.log.conf. Everything downstream nil-checks
+	// s.logtail / s.logbuffer, and s.logid stays empty. Upstream's body is
+	// kept below the flag so rebasing this patch onto upstream stays trivial.
+	const oakenLogtailEnabled = false
+	if !oakenLogtailEnabled {
+		return nil
+	}
 	if testenv.InTest() {
 		return nil
 	}
