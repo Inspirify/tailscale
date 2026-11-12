@@ -214,11 +214,17 @@ func GetDERPMap() *tailcfg.DERPMap {
 
 // getStaticDERPMap returns the DERP map that was compiled into this binary.
 func getStaticDERPMap() *tailcfg.DERPMap {
-	dm := new(tailcfg.DERPMap)
-	if err := json.Unmarshal(staticDERPMapJSON, dm); err != nil {
-		panic(err)
-	}
-	return dm
+	// Oaken patch: the embedded dns-fallback-servers.json below is a snapshot
+	// of Tailscale's public DERP map, generated from login.tailscale.com. It
+	// can never answer for an Oaken control plane (Headscale at
+	// cp.oakenmesh.com), so serving it only produces third-party contact on
+	// the bootstrap-DNS path. Return an empty map instead: GetDERPMap() then
+	// serves only the cached netmap map — the one our control plane supplies
+	// — and bootstrap candidates dial our own relays (see infra/derp/ in the
+	// Oaken repo, which puts ipv4 addresses on every node for exactly this).
+	// The embedded JSON and staticDERPMapJSON are kept, unused, so rebasing
+	// this patch onto upstream stays trivial.
+	return &tailcfg.DERPMap{Regions: make(map[tailcfg.DERPRegionID]*tailcfg.DERPRegion)}
 }
 
 //go:embed dns-fallback-servers.json

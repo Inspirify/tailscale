@@ -20,12 +20,15 @@ import (
 )
 
 func TestGetDERPMap(t *testing.T) {
+	// Oaken patch: the static map is intentionally empty — bootstrap DNS
+	// candidates come only from the cached netmap map (supplied by Oaken's
+	// control plane), never from Tailscale's public DERP list.
 	dm := GetDERPMap()
 	if dm == nil {
 		t.Fatal("nil")
 	}
-	if len(dm.Regions) == 0 {
-		t.Fatal("no regions")
+	if len(dm.Regions) != 0 {
+		t.Fatalf("static DERP map is not empty; got %d regions, want 0", len(dm.Regions))
 	}
 }
 
@@ -89,19 +92,14 @@ func TestCache(t *testing.T) {
 		t.Fatalf("region 99: got %+v; want %+v", region, initialCache.Regions[99])
 	}
 
-	// Verify that our cache can't override a statically-baked-in DERP server.
+	// Oaken patch: with the static map empty, the cached map is the whole
+	// result — the cache is authoritative, so region 1 passes through
+	// unchanged. (Upstream used to refuse this override: a baked-in DERP
+	// server could not be replaced by the cache. Oaken has no baked-in
+	// servers, so there is nothing to protect.)
 	n0 := dm.Regions[1].Nodes[0]
-	if n0.IPv4 == "127.0.0.1" || n0.IPv6 == "::1" {
-		t.Errorf("got %+v; expected no overwrite for node", n0)
-	}
-
-	// Also, make sure that the static DERP map still has the same first
-	// node as when this test was last written/updated; this ensures that
-	// we don't accidentally start allowing overwrites due to some of the
-	// test's assumptions changing out from underneath us as we update the
-	// JSON file of fallback servers.
-	if getStaticDERPMap().Regions[1].Nodes[0].HostName != "derp1c.tailscale.com" {
-		t.Errorf("DERP server has a different name; please update this test")
+	if n0.IPv4 != "127.0.0.1" || n0.IPv6 != "::1" {
+		t.Errorf("got %+v; expected the cached node to pass through unchanged", n0)
 	}
 }
 
